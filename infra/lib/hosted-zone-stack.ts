@@ -34,7 +34,7 @@ export class HostedZoneStack extends cdk.Stack {
     // Store name servers in SSM Parameter Store
     new ssm.StringParameter(this, 'NameServersParameter', {
       parameterName: `/snaphomz/hosted-zone/${props.domainName}/name-servers`,
-      stringValue: hostedZone.hostedZoneNameServers?.join(',') || '',
+      stringValue: cdk.Fn.join(',', hostedZone.hostedZoneNameServers as any),
       description: `Name servers for ${props.domainName}`,
     });
 
@@ -46,14 +46,16 @@ export class HostedZoneStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'NameServers', {
-      value: hostedZone.hostedZoneNameServers?.join(', ') || '',
+      value: cdk.Fn.join(', ', hostedZone.hostedZoneNameServers as any),
       description: 'Route 53 Name Servers',
       exportName: `SnaphomzNameServers-${props.domainName}`,
     });
 
     // Instructions for domain configuration
     new cdk.CfnOutput(this, 'DomainConfigurationInstructions', {
-      value: `Update your domain registrar to use these name servers: ${hostedZone.hostedZoneNameServers?.join(', ') || 'N/A'}`,
+      value: cdk.Fn.sub('Update your domain registrar to use these name servers: ${NS}', {
+        NS: cdk.Fn.join(', ', hostedZone.hostedZoneNameServers as any),
+      }),
       description: 'Instructions for DNS configuration',
     });
   }
