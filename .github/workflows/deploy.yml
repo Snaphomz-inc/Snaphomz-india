@@ -109,6 +109,25 @@ jobs:
         working-directory: infra
         run: npm install
 
+      - name: Clean up existing S3 bucket if it exists
+        env:
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+        run: |
+          BUCKET_NAME="snaphomz-india-$ENVIRONMENT-${{ secrets.AWS_ACCOUNT_ID }}"
+          echo "🧹 Checking for existing S3 bucket: $BUCKET_NAME"
+          
+          if aws s3 ls "s3://$BUCKET_NAME" 2>/dev/null; then
+            echo "🗑️  Deleting existing S3 bucket and contents..."
+            aws s3 rm "s3://$BUCKET_NAME" --recursive
+            aws s3api delete-bucket --bucket "$BUCKET_NAME" --region us-east-1
+            echo "✅ Bucket deleted successfully"
+            
+            # Wait for bucket deletion to complete
+            sleep 5
+          else
+            echo "✅ No existing bucket found, proceeding with deployment"
+          fi
+
       - name: Deploy infrastructure with CDK
         working-directory: infra
         env:
