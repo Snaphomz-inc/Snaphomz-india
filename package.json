@@ -6,7 +6,20 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "build:demo": "VITE_ENV=demo vite build",
+    "build:staging": "VITE_ENV=staging vite build",
+    "build:prod": "VITE_ENV=prod vite build",
+    "preview": "vite preview",
+    "deploy:infra": "cd infra && npm run deploy",
+    "deploy:infra:demo": "cd infra && npm run deploy:demo && cd ..",
+    "deploy:app": "node scripts/deploy-app.js",
+    "deploy:app:demo": "npm run build:demo && node scripts/deploy-app.js demo",
+    "deploy:app:staging": "npm run build:staging && node scripts/deploy-app.js staging",
+    "deploy:app:prod": "npm run build:prod && node scripts/deploy-app.js prod",
+    "deploy": "npm run build && npm run deploy:app",
+    "deploy:full": "npm run build && npm run deploy:infra && npm run deploy:app",
+    "setup:infra": "node scripts/setup-infra.js",
+    "setup:secrets": "node scripts/setup-github-secrets.js"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -1,0 +1,246 @@
+name: Deploy Snaphomz India to AWS
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - staging
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'demo'
+        type: choice
+        options:
+          - demo
+          - staging
+          - prod
+      create_hosted_zone:
+        description: 'Create hosted zone (only needed once)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '18'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy_infra: ${{ steps.set-env.outputs.deploy_infra }}
+    
+    steps:
+      - name: Set environment from branch
+        id: set-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            DEPLOY_INFRA="${{ github.event.inputs.create_hosted_zone }}"
+          else
+            case "${{ github.ref }}" in
+              refs/heads/main)
+                ENVIRONMENT="prod"
+                DEPLOY_INFRA="false"
+                ;;
+              refs/heads/staging)
+                ENVIRONMENT="staging"
+                DEPLOY_INFRA="false"
+                ;;
+              refs/heads/develop)
+                ENVIRONMENT="demo"
+                DEPLOY_INFRA="false"
+                ;;
+              *)
+                ENVIRONMENT="demo"
+                DEPLOY_INFRA="false"
+                ;;
+            esac
+          fi
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "deploy_infra=$DEPLOY_INFRA" >> $GITHUB_OUTPUT
+          echo "Deploying to environment: $ENVIRONMENT"
+          echo "Deploy Infrastructure: $DEPLOY_INFRA"
+
+  build-and-deploy:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+      url: ${{ steps.deployment.outputs.url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Build Vite application
+        env:
+          VITE_ENV: ${{ needs.setup.outputs.environment }}
+        run: npm run build:${{ needs.setup.outputs.environment }}
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm install
+
+      - name: Create hosted zone (if needed)
+        if: needs.setup.outputs.deploy_infra == 'true'
+        working-directory: infra
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+          DOMAIN_NAME: snaphomz.in
+          CREATE_HOSTED_ZONE: 'true'
+        run: |
+          npm run build
+          npx cdk deploy SnaphomzHostedZone --require-approval never
+          
+          # Output hosted zone details
+          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --query "HostedZones[?Name=='snaphomz.in.'].Id" --output text | cut -d'/' -f3)
+          echo "Hosted Zone ID: $HOSTED_ZONE_ID"
+          echo "HOSTED_ZONE_ID=$HOSTED_ZONE_ID" >> $GITHUB_ENV
+
+      - name: Deploy infrastructure with CDK
+        working-directory: infra
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+          CUSTOM_DOMAIN: snaphomz.in
+          HOSTED_ZONE_NAME: snaphomz.in
+          CREATE_CERTIFICATE: 'true'
+        run: |
+          # Get or create hosted zone
+          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --query "HostedZones[?Name=='snaphomz.in.'].Id" --output text | cut -d'/' -f3)
+          
+          if [ -z "$HOSTED_ZONE_ID" ]; then
+            echo "Creating hosted zone..."
+            npm run build
+            npx cdk deploy SnaphomzHostedZone --require-approval never
+            HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --query "HostedZones[?Name=='snaphomz.in.'].Id" --output text | cut -d'/' -f3)
+          fi
+          
+          export HOSTED_ZONE_ID=$HOSTED_ZONE_ID
+          npm run build
+          npx cdk deploy snaphomz-india-$ENVIRONMENT --require-approval never
+
+      - name: Get S3 bucket name and CloudFront distribution ID
+        id: aws-resources
+        env:
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+        run: |
+          BUCKET_NAME=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/bucket-name --query 'Parameter.Value' --output text)
+          DISTRIBUTION_ID=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/distribution-id --query 'Parameter.Value' --output text)
+          DISTRIBUTION_DOMAIN=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/distribution-domain --query 'Parameter.Value' --output text)
+          
+          echo "bucket-name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "distribution-id=$DISTRIBUTION_ID" >> $GITHUB_OUTPUT
+          echo "distribution-domain=$DISTRIBUTION_DOMAIN" >> $GITHUB_OUTPUT
+          echo "S3 Bucket: $BUCKET_NAME"
+          echo "CloudFront Distribution: $DISTRIBUTION_ID"
+          echo "Distribution Domain: $DISTRIBUTION_DOMAIN"
+
+      - name: Upload to S3
+        env:
+          BUCKET_NAME: ${{ steps.aws-resources.outputs.bucket-name }}
+        run: |
+          # Upload static assets with long cache
+          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "*.html" \
+            --exclude "*.json" \
+            --exclude "*.xml"
+          
+          # Upload HTML with short cache
+          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --include "*.html" \
+            --content-type "text/html"
+          
+          # Upload manifest and config files
+          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --cache-control "public, max-age=3600" \
+            --include "*.json" \
+            --include "*.xml"
+
+      - name: Invalidate CloudFront cache
+        env:
+          DISTRIBUTION_ID: ${{ steps.aws-resources.outputs.distribution-id }}
+        run: |
+          aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
+          echo "CloudFront cache invalidation initiated"
+
+      - name: Deployment summary
+        id: deployment
+        env:
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+          DISTRIBUTION_ID: ${{ steps.aws-resources.outputs.distribution-id }}
+          DISTRIBUTION_DOMAIN: ${{ steps.aws-resources.outputs.distribution-domain }}
+        run: |
+          # Determine the URL
+          URL="https://$DISTRIBUTION_DOMAIN"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          
+          echo "✅ Deployment Complete!"
+          echo "Environment: $ENVIRONMENT"
+          echo "S3 Bucket: ${{ steps.aws-resources.outputs.bucket-name }}"
+          echo "CloudFront Distribution: $DISTRIBUTION_ID"
+          echo "Distribution Domain: $DISTRIBUTION_DOMAIN"
+          echo "URL: $URL"
+          echo "Deployment URL: $URL"
+
+  notify:
+    needs: [setup, build-and-deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "Snaphomz India Deployment ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Snaphomz India Deployment ${{ job.status }}*\n*Environment:* ${{ needs.setup.outputs.environment }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

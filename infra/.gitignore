@@ -1,0 +1,10 @@
+*.js
+*.d.ts
+node_modules/
+dist/
+cdk.out/
+*.swp
+*.swo
+*~
+*.orig
+.DS_Store
