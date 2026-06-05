@@ -42,17 +42,19 @@ export class HostedZoneStack extends cdk.Stack {
       description: `Name servers for ${props.domainName}`,
     });
 
-    // Outputs
+    // Outputs (use hyphens instead of dots for export names - dots are not allowed)
+    const exportDomainSafe = props.domainName.replace(/\./g, '-');
+    
     new cdk.CfnOutput(this, 'HostedZoneId', {
       value: hostedZone.hostedZoneId,
       description: 'Route 53 Hosted Zone ID',
-      exportName: `SnaphomzHostedZone-${props.domainName}`,
+      exportName: `SnaphomzHostedZone-${exportDomainSafe}`,
     });
 
     new cdk.CfnOutput(this, 'NameServers', {
       value: cdk.Fn.join(', ', hostedZone.hostedZoneNameServers as any),
       description: 'Route 53 Name Servers',
-      exportName: `SnaphomzNameServers-${props.domainName}`,
+      exportName: `SnaphomzNameServers-${exportDomainSafe}`,
     });
 
     // Instructions for domain configuration
