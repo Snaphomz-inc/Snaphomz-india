@@ -109,6 +109,43 @@ jobs:
         working-directory: infra
         run: npm install
 
+      - name: Wait for any existing stacks to stabilize
+        env:
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+          STACK_NAME: snaphomz-india-${{ needs.setup.outputs.environment }}
+        run: |
+          echo "⏳ Checking if stack is in a stable state..."
+          
+          # Try to get stack status with retries
+          for attempt in {1..30}; do
+            STACK_STATUS=$(aws cloudformation describe-stacks \
+              --stack-name $STACK_NAME \
+              --query 'Stacks[0].StackStatus' \
+              --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+            
+            echo "Attempt $attempt: Stack status = $STACK_STATUS"
+            
+            if [ "$STACK_STATUS" == "DOES_NOT_EXIST" ]; then
+              echo "✅ Stack does not exist, ready for deployment"
+              break
+            elif [ "$STACK_STATUS" == "CREATE_COMPLETE" ] || [ "$STACK_STATUS" == "UPDATE_COMPLETE" ]; then
+              echo "✅ Stack is stable and ready for deployment"
+              break
+            elif [[ "$STACK_STATUS" == *"IN_PROGRESS"* ]]; then
+              echo "⏳ Stack is still in progress, waiting 10 seconds..."
+              sleep 10
+            elif [[ "$STACK_STATUS" == *"ROLLBACK"* ]] || [[ "$STACK_STATUS" == *"FAILED"* ]]; then
+              echo "⚠️  Stack is in $STACK_STATUS state, will attempt to delete and recreate"
+              aws cloudformation delete-stack --stack-name $STACK_NAME
+              echo "Waiting for deletion..."
+              sleep 20
+              break
+            else
+              echo "⚠️  Stack status: $STACK_STATUS"
+              sleep 5
+            fi
+          done
+
       - name: Clean up existing S3 bucket if it exists
         env:
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
