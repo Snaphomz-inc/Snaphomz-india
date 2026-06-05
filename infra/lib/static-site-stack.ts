@@ -156,7 +156,7 @@ export class StaticSiteStack extends cdk.Stack {
       console.log(`[StaticSiteStack] Alias record created successfully`);
 
       // Also output the alias record details
-      new cdk.CfnOutput(this, 'AliasRecord', {
+      new cdk.CfnOutput(this, 'AliasRecordOutput', {
         value: `${props.customDomain} -> ${distribution.domainName}`,
         description: 'Route 53 Alias Record',
       });
