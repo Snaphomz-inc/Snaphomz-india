@@ -15,6 +15,8 @@ export class HostedZoneStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: HostedZoneStackProps) {
     super(scope, id, props);
 
+    console.log(`[HostedZoneStack] Creating hosted zone for ${props.domainName}`);
+
     // Create Route 53 Hosted Zone
     const hostedZone = new route53.PublicHostedZone(this, 'HostedZone', {
       zoneName: props.domainName,
@@ -23,6 +25,8 @@ export class HostedZoneStack extends cdk.Stack {
 
     this.hostedZoneId = hostedZone.hostedZoneId;
     this.nameServers = hostedZone.hostedZoneNameServers || [];
+
+    console.log(`[HostedZoneStack] Hosted zone created: ${hostedZone.hostedZoneId}`);
 
     // Store hosted zone ID in SSM Parameter Store
     new ssm.StringParameter(this, 'HostedZoneIdParameter', {
@@ -58,5 +62,7 @@ export class HostedZoneStack extends cdk.Stack {
       }),
       description: 'Instructions for DNS configuration',
     });
+
+    console.log(`[HostedZoneStack] Stack setup complete`);
   }
 }
