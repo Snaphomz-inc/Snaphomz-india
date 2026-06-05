@@ -127,8 +127,15 @@ export class StaticSiteStack extends cdk.Stack {
     this.distributionDomainName = distribution.domainName;
     this.distributionId = distribution.distributionId;
 
+    console.log(`[StaticSiteStack] Distribution created: ${distribution.domainName}`);
+    console.log(`[StaticSiteStack] Custom Domain: ${props.customDomain}`);
+    console.log(`[StaticSiteStack] Hosted Zone ID: ${props.hostedZoneId}`);
+    console.log(`[StaticSiteStack] Hosted Zone Name: ${props.hostedZoneName}`);
+
     // Create Route 53 alias record if custom domain and hosted zone are provided
     if (props.customDomain && props.hostedZoneId && props.hostedZoneName) {
+      console.log(`[StaticSiteStack] Creating Alias record for ${props.customDomain}`);
+      
       const hostedZone = route53.HostedZone.fromHostedZoneAttributes(
         this,
         'HostedZoneForAlias',
@@ -138,13 +145,26 @@ export class StaticSiteStack extends cdk.Stack {
         }
       );
 
-      new route53.ARecord(this, 'AliasRecord', {
+      const aliasRecord = new route53.ARecord(this, 'AliasRecord', {
         zone: hostedZone,
         recordName: props.customDomain,
         target: route53.RecordTarget.fromAlias(
           new route53Targets.CloudFrontTarget(distribution)
         ),
       });
+      
+      console.log(`[StaticSiteStack] Alias record created successfully`);
+
+      // Also output the alias record details
+      new cdk.CfnOutput(this, 'AliasRecord', {
+        value: `${props.customDomain} -> ${distribution.domainName}`,
+        description: 'Route 53 Alias Record',
+      });
+    } else {
+      console.warn(`[StaticSiteStack] Skipping Route53 record creation - missing parameters`);
+      if (!props.customDomain) console.warn('  - customDomain not provided');
+      if (!props.hostedZoneId) console.warn('  - hostedZoneId not provided');
+      if (!props.hostedZoneName) console.warn('  - hostedZoneName not provided');
     }
 
     // Store important values in SSM Parameter Store

@@ -152,6 +152,8 @@ jobs:
             --query 'HostedZones[0].Id' \
             --output text 2>/dev/null | cut -d'/' -f3)
           
+          echo "📋 Zone ID query result: '$HOSTED_ZONE_ID'"
+          
           if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ] || [ "$HOSTED_ZONE_ID" == "" ]; then
             echo "✅ Hosted zone not found. Creating..."
             
@@ -177,6 +179,8 @@ jobs:
               --query 'HostedZones[0].Id' \
               --output text 2>/dev/null | cut -d'/' -f3)
             
+            echo "📋 Zone ID after creation: '$HOSTED_ZONE_ID'"
+            
             if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ]; then
               echo "⚠️  Could not retrieve hosted zone ID after creation, retrying..."
               sleep 5
@@ -184,9 +188,15 @@ jobs:
                 --dns-name snaphomz.in \
                 --query 'HostedZones[0].Id' \
                 --output text 2>/dev/null | cut -d'/' -f3)
+              echo "📋 Zone ID after retry: '$HOSTED_ZONE_ID'"
             fi
             
-            echo "✅ Created hosted zone: $HOSTED_ZONE_ID"
+            if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ]; then
+              echo "❌ Failed to get hosted zone ID"
+              HOSTED_ZONE_ID=""
+            else
+              echo "✅ Created hosted zone: $HOSTED_ZONE_ID"
+            fi
           else
             echo "✅ Using existing hosted zone: $HOSTED_ZONE_ID"
           fi
@@ -196,11 +206,13 @@ jobs:
           echo "📡 Deploying static site stack..."
           if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ] || [ "$HOSTED_ZONE_ID" == "" ]; then
             echo "⚠️  Warning: Hosted zone ID not found/empty, deploying without custom domain"
+            echo "📋 Deployment will create S3 and CloudFront but NO Route53 Alias record"
             npx cdk deploy snaphomz-india-$ENVIRONMENT \
               -c deploy-mode=static-site \
               --require-approval never
           else
             echo "✅ Deploying static site stack with hosted zone: $HOSTED_ZONE_ID"
+            echo "📋 This will create Route53 Alias record: snaphomz.in → CloudFront"
             npx cdk deploy snaphomz-india-$ENVIRONMENT \
               -c deploy-mode=static-site \
               -c hosted-zone-id=$HOSTED_ZONE_ID \
