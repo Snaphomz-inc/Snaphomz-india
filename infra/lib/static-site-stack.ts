@@ -3,7 +3,6 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
-import * as iam from 'aws-cdk-lib/aws-iam';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
@@ -45,10 +44,13 @@ export class StaticSiteStack extends cdk.Stack {
 
     this.bucketName = siteBucket.bucketName;
 
-    // Create Origin Access Control for CloudFront
-    const oac = new cloudfront.OriginAccessControl(this, 'OAC', {
-      comment: `OAC for snaphomz-india ${environment}`,
+    // Create Origin Access Identity for CloudFront
+    const oai = new cloudfront.OriginAccessIdentity(this, 'OAI', {
+      comment: `OAI for snaphomz-india ${environment}`,
     });
+
+    // Grant CloudFront access to S3 bucket
+    siteBucket.grantRead(oai);
 
     // Setup custom domain and certificate
     let certificate: acm.ICertificate | undefined;
@@ -86,8 +88,8 @@ export class StaticSiteStack extends cdk.Stack {
     // Create CloudFront distribution
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
       defaultBehavior: {
-        origin: new origins.S3BucketOrigin(siteBucket, {
-          originAccessControl: oac,
+        origin: new origins.S3Origin(siteBucket, {
+          originAccessIdentity: oai,
         }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
@@ -118,21 +120,6 @@ export class StaticSiteStack extends cdk.Stack {
 
     this.distributionDomainName = distribution.domainName;
     this.distributionId = distribution.distributionId;
-
-    // Add bucket policy to allow CloudFront to access the bucket
-    siteBucket.addToResourcePolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
-        actions: ['s3:GetObject'],
-        resources: [siteBucket.arnForObjects('*')],
-        conditions: {
-          'StringEquals': {
-            'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/${distribution.distributionId}`,
-          },
-        },
-      })
-    );
 
     // Create Route 53 alias record if custom domain and hosted zone are provided
     if (props.customDomain && props.hostedZoneId && props.hostedZoneName) {
