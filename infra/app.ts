@@ -18,11 +18,20 @@ if (!awsAccount) {
 // Get domain and hosted zone configuration
 const customDomain = process.env.CUSTOM_DOMAIN || app.node.tryGetContext('custom-domain') || 'snaphomz.in';
 const domainName = process.env.DOMAIN_NAME || app.node.tryGetContext('domain-name') || 'snaphomz.in';
-const hostedZoneId = process.env.HOSTED_ZONE_ID || app.node.tryGetContext('hosted-zone-id');
+const hostedZoneId = process.env.HOSTED_ZONE_ID || app.node.tryGetContext('hosted-zone-id') || undefined;
 const hostedZoneName = process.env.HOSTED_ZONE_NAME || app.node.tryGetContext('hosted-zone-name') || 'snaphomz.in';
-const certificateArn = process.env.CERTIFICATE_ARN || app.node.tryGetContext('certificate-arn');
+const certificateArn = process.env.CERTIFICATE_ARN || app.node.tryGetContext('certificate-arn') || undefined;
 const createCertificate = process.env.CREATE_CERTIFICATE === 'true' || app.node.tryGetContext('create-certificate') === true;
 const createHostedZone = process.env.CREATE_HOSTED_ZONE !== 'false' && app.node.tryGetContext('create-hosted-zone') !== false;
+
+console.log('CDK App Configuration:');
+console.log(`  Environment: ${environment}`);
+console.log(`  AWS Account: ${awsAccount}`);
+console.log(`  AWS Region: ${awsRegion}`);
+console.log(`  Custom Domain: ${customDomain}`);
+console.log(`  Hosted Zone ID: ${hostedZoneId || 'NOT SET'}`);
+console.log(`  Create Certificate: ${createCertificate}`);
+console.log(`  Create Hosted Zone: ${createHostedZone}`);
 
 const env = {
   account: awsAccount,

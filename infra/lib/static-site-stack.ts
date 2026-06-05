@@ -57,31 +57,36 @@ export class StaticSiteStack extends cdk.Stack {
     const domainNames: string[] = [];
 
     if (props.customDomain) {
-      if (props.createCertificate && props.hostedZoneId && props.hostedZoneName) {
-        // Create certificate using DNS validation with existing hosted zone
-        const hostedZone = route53.HostedZone.fromHostedZoneAttributes(
-          this,
-          'HostedZone',
-          {
-            hostedZoneId: props.hostedZoneId,
-            zoneName: props.hostedZoneName,
-          }
-        );
-
-        certificate = new acm.Certificate(this, 'Certificate', {
-          domainName: props.customDomain,
-          validation: acm.CertificateValidation.fromDns(hostedZone),
-        });
-
-        domainNames.push(props.customDomain);
-      } else if (props.certificateArn) {
-        // Use existing certificate ARN
+      if (props.createCertificate && props.certificateArn) {
+        // Use existing certificate ARN (highest priority)
         certificate = acm.Certificate.fromCertificateArn(
           this,
           'Certificate',
           props.certificateArn
         );
         domainNames.push(props.customDomain);
+      } else if (props.createCertificate && props.hostedZoneId && props.hostedZoneName) {
+        // Create certificate using DNS validation with existing hosted zone
+        try {
+          const hostedZone = route53.HostedZone.fromHostedZoneAttributes(
+            this,
+            'HostedZone',
+            {
+              hostedZoneId: props.hostedZoneId,
+              zoneName: props.hostedZoneName,
+            }
+          );
+
+          certificate = new acm.Certificate(this, 'Certificate', {
+            domainName: props.customDomain,
+            validation: acm.CertificateValidation.fromDns(hostedZone),
+          });
+
+          domainNames.push(props.customDomain);
+        } catch (error) {
+          console.warn('Failed to create certificate with DNS validation:', error);
+          console.warn('Proceeding without HTTPS certificate');
+        }
       }
     }
 
