@@ -22,7 +22,8 @@ const hostedZoneId = process.env.HOSTED_ZONE_ID || app.node.tryGetContext('hoste
 const hostedZoneName = process.env.HOSTED_ZONE_NAME || app.node.tryGetContext('hosted-zone-name') || 'snaphomz.in';
 const certificateArn = process.env.CERTIFICATE_ARN || app.node.tryGetContext('certificate-arn') || undefined;
 const createCertificate = process.env.CREATE_CERTIFICATE === 'true' || app.node.tryGetContext('create-certificate') === true;
-const createHostedZone = process.env.CREATE_HOSTED_ZONE !== 'false' && app.node.tryGetContext('create-hosted-zone') !== false;
+const createHostedZone = process.env.CREATE_HOSTED_ZONE === 'true' && app.node.tryGetContext('create-hosted-zone') !== false;
+const deployMode = app.node.tryGetContext('deploy-mode') || 'all'; // 'hosted-zone', 'static-site', or 'all'
 
 console.log('CDK App Configuration:');
 console.log(`  Environment: ${environment}`);
@@ -32,33 +33,39 @@ console.log(`  Custom Domain: ${customDomain}`);
 console.log(`  Hosted Zone ID: ${hostedZoneId || 'NOT SET'}`);
 console.log(`  Create Certificate: ${createCertificate}`);
 console.log(`  Create Hosted Zone: ${createHostedZone}`);
+console.log(`  Deploy Mode: ${deployMode}`);
 
 const env = {
   account: awsAccount,
   region: awsRegion,
 };
 
-// Create Hosted Zone if needed (typically only once)
-if (createHostedZone) {
-  new HostedZoneStack(app, 'SnaphomzHostedZone', {
-    env,
-    domainName,
-    enableDnsSecValidation: false,
-    description: `Route 53 Hosted Zone for ${domainName}`,
-  });
+// Deploy based on mode to avoid cross-stack issues
+if (deployMode === 'hosted-zone' || deployMode === 'all') {
+  // Create Hosted Zone if needed (typically only once)
+  if (createHostedZone) {
+    new HostedZoneStack(app, 'SnaphomzHostedZone', {
+      env,
+      domainName,
+      enableDnsSecValidation: false,
+      description: `Route 53 Hosted Zone for ${domainName}`,
+    });
+  }
 }
 
-// Create Static Site Stack
-const stackName = `snaphomz-india-${environment}`;
-new StaticSiteStack(app, stackName, {
-  env,
-  environment,
-  description: `Snaphomz India Static Site - ${environment} environment`,
-  customDomain,
-  hostedZoneId,
-  hostedZoneName,
-  certificateArn,
-  createCertificate,
-});
+if (deployMode === 'static-site' || deployMode === 'all') {
+  // Create Static Site Stack
+  const stackName = `snaphomz-india-${environment}`;
+  new StaticSiteStack(app, stackName, {
+    env,
+    environment,
+    description: `Snaphomz India Static Site - ${environment} environment`,
+    customDomain,
+    hostedZoneId,
+    hostedZoneName,
+    certificateArn,
+    createCertificate,
+  });
+}
 
 app.synth();
