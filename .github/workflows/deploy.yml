@@ -1,4 +1,4 @@
-﻿name: Deploy Snaphomz India to AWS
+name: Deploy Snaphomz India to AWS
 
 # 3-job architecture:
 #   Job 1 (setup):          determine environment from branch
