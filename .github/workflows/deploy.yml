@@ -1,9 +1,12 @@
 ﻿name: Deploy Snaphomz India to AWS
 
-# Architecture matches snaphomz.com exactly:
-#   Namecheap ALIAS record -> CloudFront (live DNS)
-#   Route53 hosted zone exists with A/AAAA records (ready for future NS delegation)
-#   ACM cert already ISSUED - imported by ARN, no DNS validation wait
+# 3-job architecture:
+#   Job 1 (setup):          determine environment from branch
+#   Job 2 (hosted-zone):    create Route53 hosted zone if not exists, output zone ID
+#   Job 3 (deploy):         build Vite, CDK deploy (S3+CF+cert+A/AAAA), S3 upload, CF invalidate
+#
+# ACM cert already ISSUED - imported by ARN so no DNS validation wait in job 3.
+# Namecheap ALIAS -> CloudFront handles live traffic until NS is delegated to Route53.
 
 on:
   push:
@@ -30,22 +33,14 @@ env:
   CERTIFICATE_ARN: arn:aws:acm:us-east-1:075502422618:certificate/cb92c6e2-9b6e-4426-b9ca-045b67bd4499
 
 jobs:
-  deploy:
+  # ── Job 1: Determine environment ───────────────────────────────────────────
+  setup:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    environment:
-      name: ${{ github.ref == 'refs/heads/main' && 'prod' || github.ref == 'refs/heads/staging' && 'staging' || 'demo' }}
-      url: https://snaphomz.in
-
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set environment
-        id: env
+      - name: Set environment from branch
+        id: set-env
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             ENVIRONMENT="${{ github.event.inputs.environment }}"
@@ -53,11 +48,102 @@ jobs:
             case "${{ github.ref }}" in
               refs/heads/main)     ENVIRONMENT="prod"    ;;
               refs/heads/staging)  ENVIRONMENT="staging" ;;
+              refs/heads/develop)  ENVIRONMENT="demo"    ;;
               *)                   ENVIRONMENT="demo"    ;;
             esac
           fi
           echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
           echo "Deploying to: $ENVIRONMENT"
+
+  # ── Job 2: Create Route53 Hosted Zone (idempotent, skips if exists) ────────
+  hosted-zone:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      hosted_zone_id: ${{ steps.get-zone.outputs.hosted_zone_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm install
+
+      - name: Build CDK TypeScript
+        working-directory: infra
+        run: npm run build
+
+      - name: Deploy SnaphomzHostedZone stack (idempotent)
+        working-directory: infra
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          DOMAIN_NAME: snaphomz.in
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+        run: |
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name SnaphomzHostedZone \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          if [[ "$STACK_STATUS" == "DOES_NOT_EXIST" ]]; then
+            echo "Creating SnaphomzHostedZone stack..."
+            npx cdk deploy SnaphomzHostedZone --require-approval never
+            echo "Hosted zone stack created"
+          else
+            echo "SnaphomzHostedZone already exists (status: $STACK_STATUS) - skipping"
+          fi
+
+      - name: Get hosted zone ID from SSM
+        id: get-zone
+        run: |
+          HOSTED_ZONE_ID=$(aws ssm get-parameter \
+            --name /snaphomz/hosted-zone/snaphomz.in/zone-id \
+            --query 'Parameter.Value' --output text)
+          echo "hosted_zone_id=$HOSTED_ZONE_ID" >> $GITHUB_OUTPUT
+          echo "Hosted Zone ID: $HOSTED_ZONE_ID"
+
+      - name: Show Route53 name servers
+        run: |
+          NS=$(aws ssm get-parameter \
+            --name /snaphomz/hosted-zone/snaphomz.in/name-servers \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          if [[ -n "$NS" ]]; then
+            echo "Route53 name servers for snaphomz.in (update Namecheap if delegating):"
+            echo "$NS" | tr ',' '\n'
+          fi
+
+  # ── Job 3: Build + CDK deploy + S3 upload ─────────────────────────────────
+  deploy:
+    needs: [setup, hosted-zone]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+      url: https://snaphomz.in
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -86,23 +172,27 @@ jobs:
         working-directory: infra
         run: npm run build
 
-      - name: Deploy CDK stack
+      - name: Deploy CDK static site stack
         working-directory: infra
         env:
           CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
-          ENVIRONMENT: ${{ steps.env.outputs.environment }}
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
           CUSTOM_DOMAIN: snaphomz.in
+          HOSTED_ZONE_ID: ${{ needs.hosted-zone.outputs.hosted_zone_id }}
+          HOSTED_ZONE_NAME: snaphomz.in
           CERTIFICATE_ARN: ${{ env.CERTIFICATE_ARN }}
         run: |
           echo "Deploying snaphomz-india-$ENVIRONMENT..."
+          echo "Hosted Zone: $HOSTED_ZONE_ID"
+          echo "Cert ARN:    $CERTIFICATE_ARN"
           npx cdk deploy snaphomz-india-$ENVIRONMENT --require-approval never
-          echo "CDK stack deployed"
+          echo "CDK deploy complete"
 
-      - name: Get deployment resources
+      - name: Get deployment resources from SSM
         id: resources
         env:
-          ENVIRONMENT: ${{ steps.env.outputs.environment }}
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
         run: |
           BUCKET=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/bucket-name --query 'Parameter.Value' --output text)
           DIST_ID=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/distribution-id --query 'Parameter.Value' --output text)
@@ -110,6 +200,9 @@ jobs:
           echo "bucket=$BUCKET"           >> $GITHUB_OUTPUT
           echo "dist-id=$DIST_ID"         >> $GITHUB_OUTPUT
           echo "dist-domain=$DIST_DOMAIN" >> $GITHUB_OUTPUT
+          echo "Bucket:    $BUCKET"
+          echo "Dist ID:   $DIST_ID"
+          echo "CF Domain: $DIST_DOMAIN"
 
       - name: Upload to S3
         env:
