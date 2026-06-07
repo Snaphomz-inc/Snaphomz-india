@@ -8,6 +8,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 
+// Reference pattern: snaphomz-toolpage (static site) + Snaphomz-frontend-prod (A/AAAA records)
 interface StaticSiteStackProps extends cdk.StackProps {
   environment: string;
   customDomain?: string;
@@ -27,13 +28,12 @@ export class StaticSiteStack extends cdk.Stack {
 
     const environment = props.environment;
 
-    // Create S3 bucket for static site hosting
+    // S3 bucket — RETAIN like snaphomz-toolpage (no autoDeleteObjects Lambda)
     const siteBucket = new s3.Bucket(this, 'SiteBucket', {
       bucketName: `snaphomz-india-${environment}-${this.account}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       versioned: true,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
       lifecycleRules: [
@@ -45,53 +45,45 @@ export class StaticSiteStack extends cdk.Stack {
 
     this.bucketName = siteBucket.bucketName;
 
-    // Create Origin Access Identity for CloudFront
+    // CloudFront Origin Access Identity
     const oai = new cloudfront.OriginAccessIdentity(this, 'OAI', {
       comment: `OAI for snaphomz-india ${environment}`,
     });
 
-    // Grant CloudFront access to S3 bucket
     siteBucket.grantRead(oai);
 
-    // Setup custom domain and certificate
+    // Certificate — like snaphomz-toolpage:
+    //   if certificateArn provided  → import existing cert (fastest, no waiting)
+    //   if createCertificate + zone  → create cert with DNS validation against existing zone
     let certificate: acm.ICertificate | undefined;
     const domainNames: string[] = [];
 
     if (props.customDomain) {
-      if (props.createCertificate && props.certificateArn) {
-        // Use existing certificate ARN (highest priority)
+      if (props.certificateArn) {
         certificate = acm.Certificate.fromCertificateArn(
           this,
           'Certificate',
-          props.certificateArn
+          props.certificateArn,
         );
         domainNames.push(props.customDomain);
       } else if (props.createCertificate && props.hostedZoneId && props.hostedZoneName) {
-        // Create certificate using DNS validation with existing hosted zone
-        try {
-          const hostedZone = route53.HostedZone.fromHostedZoneAttributes(
-            this,
-            'HostedZone',
-            {
-              hostedZoneId: props.hostedZoneId,
-              zoneName: props.hostedZoneName,
-            }
-          );
-
-          certificate = new acm.Certificate(this, 'Certificate', {
-            domainName: props.customDomain,
-            validation: acm.CertificateValidation.fromDns(hostedZone),
-          });
-
-          domainNames.push(props.customDomain);
-        } catch (error) {
-          console.warn('Failed to create certificate with DNS validation:', error);
-          console.warn('Proceeding without HTTPS certificate');
-        }
+        const hostedZone = route53.HostedZone.fromHostedZoneAttributes(
+          this,
+          'HostedZone',
+          {
+            hostedZoneId: props.hostedZoneId,
+            zoneName: props.hostedZoneName,
+          },
+        );
+        certificate = new acm.Certificate(this, 'Certificate', {
+          domainName: props.customDomain,
+          validation: acm.CertificateValidation.fromDns(hostedZone),
+        });
+        domainNames.push(props.customDomain);
       }
     }
 
-    // Create CloudFront distribution
+    // CloudFront distribution — like snaphomz-toolpage
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
       defaultBehavior: {
         origin: new origins.S3Origin(siteBucket, {
@@ -127,47 +119,41 @@ export class StaticSiteStack extends cdk.Stack {
     this.distributionDomainName = distribution.domainName;
     this.distributionId = distribution.distributionId;
 
-    console.log(`[StaticSiteStack] Distribution created: ${distribution.domainName}`);
-    console.log(`[StaticSiteStack] Custom Domain: ${props.customDomain}`);
-    console.log(`[StaticSiteStack] Hosted Zone ID: ${props.hostedZoneId}`);
-    console.log(`[StaticSiteStack] Hosted Zone Name: ${props.hostedZoneName}`);
-
-    // Create Route 53 alias record if custom domain and hosted zone are provided
+    // Route53 A + AAAA records — alias to CloudFront
+    // Reference pattern: Snaphomz-frontend-prod terraform/module/route53/main.tf
     if (props.customDomain && props.hostedZoneId && props.hostedZoneName) {
-      console.log(`[StaticSiteStack] Creating Alias record for ${props.customDomain}`);
-      
       const hostedZone = route53.HostedZone.fromHostedZoneAttributes(
         this,
         'HostedZoneForAlias',
         {
           hostedZoneId: props.hostedZoneId,
           zoneName: props.hostedZoneName,
-        }
+        },
       );
 
-      const aliasRecord = new route53.ARecord(this, 'AliasRecord', {
+      const cfTarget = route53.RecordTarget.fromAlias(
+        new route53Targets.CloudFrontTarget(distribution),
+      );
+
+      new route53.ARecord(this, 'ARecord', {
         zone: hostedZone,
         recordName: props.customDomain,
-        target: route53.RecordTarget.fromAlias(
-          new route53Targets.CloudFrontTarget(distribution)
-        ),
+        target: cfTarget,
       });
-      
-      console.log(`[StaticSiteStack] Alias record created successfully`);
 
-      // Also output the alias record details
-      new cdk.CfnOutput(this, 'AliasRecordOutput', {
-        value: `${props.customDomain} -> ${distribution.domainName}`,
-        description: 'Route 53 Alias Record',
+      new route53.AaaaRecord(this, 'AaaaRecord', {
+        zone: hostedZone,
+        recordName: props.customDomain,
+        target: cfTarget,
       });
-    } else {
-      console.warn(`[StaticSiteStack] Skipping Route53 record creation - missing parameters`);
-      if (!props.customDomain) console.warn('  - customDomain not provided');
-      if (!props.hostedZoneId) console.warn('  - hostedZoneId not provided');
-      if (!props.hostedZoneName) console.warn('  - hostedZoneName not provided');
+
+      new cdk.CfnOutput(this, 'DnsRecords', {
+        value: `A + AAAA: ${props.customDomain} → ${distribution.domainName}`,
+        description: 'Route53 alias records pointing to CloudFront',
+      });
     }
 
-    // Store important values in SSM Parameter Store
+    // SSM Parameter Store — like snaphomz-toolpage
     new ssm.StringParameter(this, 'BucketNameParameter', {
       parameterName: `/snaphomz/india/${environment}/bucket-name`,
       stringValue: siteBucket.bucketName,
@@ -186,7 +172,7 @@ export class StaticSiteStack extends cdk.Stack {
       description: 'CloudFront distribution domain name',
     });
 
-    // Outputs
+    // CloudFormation Outputs
     new cdk.CfnOutput(this, 'BucketName', {
       value: siteBucket.bucketName,
       description: 'S3 bucket name',

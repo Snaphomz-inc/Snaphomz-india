@@ -1,5 +1,15 @@
 name: Deploy Snaphomz India to AWS
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture (three reference repos)
+#   hosted-zone      → schooltocollege-static pattern  (separate OIDC token)
+#   deploy-and-upload → snaphomz-toolpage pattern       (fresh OIDC token)
+#     • CDK: S3 + CloudFront + ACM cert (DNS validation)
+#     • CDK: A + AAAA alias records  → Snaphomz-frontend-prod pattern
+#     • S3 sync + CloudFront invalidation
+# Each job gets its own 1-hour OIDC token → no more ExpiredToken during cert wait
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     branches:
@@ -11,75 +21,137 @@ on:
       environment:
         description: 'Environment to deploy to'
         required: true
-        default: 'demo'
+        default: 'prod'
         type: choice
         options:
-          - demo
-          - staging
           - prod
-      create_hosted_zone:
-        description: 'Create hosted zone (only needed once)'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
+          - staging
+          - demo
 
 env:
   AWS_REGION: us-east-1
-  NODE_VERSION: '18'
+  NODE_VERSION: '20'
 
 jobs:
+  # ── 1. Determine environment ───────────────────────────────────────────────
   setup:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.set-env.outputs.environment }}
-      deploy_infra: ${{ steps.set-env.outputs.deploy_infra }}
-    
     steps:
       - name: Set environment from branch
         id: set-env
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             ENVIRONMENT="${{ github.event.inputs.environment }}"
-            DEPLOY_INFRA="${{ github.event.inputs.create_hosted_zone }}"
           else
             case "${{ github.ref }}" in
-              refs/heads/main)
-                ENVIRONMENT="prod"
-                DEPLOY_INFRA="false"
-                ;;
-              refs/heads/staging)
-                ENVIRONMENT="staging"
-                DEPLOY_INFRA="false"
-                ;;
-              refs/heads/develop)
-                ENVIRONMENT="demo"
-                DEPLOY_INFRA="false"
-                ;;
-              *)
-                ENVIRONMENT="demo"
-                DEPLOY_INFRA="false"
-                ;;
+              refs/heads/main)     ENVIRONMENT="prod"    ;;
+              refs/heads/staging)  ENVIRONMENT="staging" ;;
+              refs/heads/develop)  ENVIRONMENT="demo"    ;;
+              *)                   ENVIRONMENT="demo"    ;;
             esac
           fi
           echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
-          echo "deploy_infra=$DEPLOY_INFRA" >> $GITHUB_OUTPUT
-          echo "Deploying to environment: $ENVIRONMENT"
-          echo "Deploy Infrastructure: $DEPLOY_INFRA"
+          echo "Deploying to: $ENVIRONMENT"
 
-  build-and-deploy:
+  # ── 2. Create / ensure hosted zone exists ─────────────────────────────────
+  # Reference: schooltocollege-static (.github/workflows/deploy.yml)
+  # Own OIDC token — fast, just Route53
+  hosted-zone:
     needs: setup
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-    
+    outputs:
+      hosted_zone_id: ${{ steps.get-zone-id.outputs.hosted_zone_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm install
+
+      - name: Build CDK TypeScript
+        working-directory: infra
+        run: npm run build
+
+      - name: Deploy SnaphomzHostedZone stack
+        working-directory: infra
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          DOMAIN_NAME: snaphomz.in
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+        run: |
+          # Check whether the CloudFormation stack already exists
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name SnaphomzHostedZone \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          if [[ "$STACK_STATUS" == "DOES_NOT_EXIST" ]]; then
+            echo "⏳ Creating SnaphomzHostedZone stack for the first time..."
+            npx cdk deploy SnaphomzHostedZone --require-approval never
+            echo "✅ Hosted zone stack created"
+          else
+            echo "✅ SnaphomzHostedZone stack already exists (status: $STACK_STATUS)"
+            echo "   Skipping re-deploy — hosted zone is idempotent"
+          fi
+
+      - name: Get hosted zone ID from SSM
+        id: get-zone-id
+        run: |
+          HOSTED_ZONE_ID=$(aws ssm get-parameter \
+            --name /snaphomz/hosted-zone/snaphomz.in/zone-id \
+            --query 'Parameter.Value' \
+            --output text)
+          echo "hosted_zone_id=$HOSTED_ZONE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Hosted Zone ID: $HOSTED_ZONE_ID"
+
+      - name: Show name servers (update domain registrar if first run)
+        run: |
+          NAME_SERVERS=$(aws ssm get-parameter \
+            --name /snaphomz/hosted-zone/snaphomz.in/name-servers \
+            --query 'Parameter.Value' \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$NAME_SERVERS" ]]; then
+            echo "📋 Route53 name servers for snaphomz.in:"
+            echo "$NAME_SERVERS" | tr ',' '\n' | sed 's/^ */  • /'
+            echo ""
+            echo "⚠️  Make sure your domain registrar delegates snaphomz.in to these NS records."
+            echo "   Certificate DNS validation will only succeed once delegation is active."
+          fi
+
+  # ── 3. Build React app + deploy CDK site stack + upload to S3 ─────────────
+  # Reference: snaphomz-toolpage (.github/workflows/deploy.yml)
+  # Own OIDC token — up to 60 min available for cert DNS validation + CF deploy
+  deploy-and-upload:
+    needs: [setup, hosted-zone]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
     environment:
       name: ${{ needs.setup.outputs.environment }}
-      url: ${{ steps.deployment.outputs.url }}
-    
+      url: https://snaphomz.in
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -97,253 +169,104 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
+      # ── Build React / Vite app ─────────────────────────────────────────────
       - name: Install root dependencies
         run: npm install
 
       - name: Build Vite application
         env:
           VITE_ENV: ${{ needs.setup.outputs.environment }}
-        run: npm run build:${{ needs.setup.outputs.environment }}
+        run: npm run build
 
+      # ── Deploy CDK infrastructure ──────────────────────────────────────────
+      # Creates: S3 bucket, CloudFront distribution, ACM certificate (DNS validation),
+      #          Route53 A record, Route53 AAAA record
+      # Pattern: snaphomz-toolpage + Snaphomz-frontend-prod (A/AAAA)
       - name: Install CDK dependencies
         working-directory: infra
         run: npm install
 
-      - name: Wait for any existing stacks to stabilize
-        env:
-          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
-          STACK_NAME: snaphomz-india-${{ needs.setup.outputs.environment }}
-        run: |
-          echo "⏳ Checking if stack is in a stable state..."
-          
-          STACK_STATUS=$(aws cloudformation describe-stacks \
-            --stack-name $STACK_NAME \
-            --query 'Stacks[0].StackStatus' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -z "$STACK_STATUS" ]; then
-            echo "✅ Stack does not exist, ready for deployment"
-          elif [[ "$STACK_STATUS" == *"COMPLETE"* ]]; then
-            echo "✅ Stack is complete: $STACK_STATUS"
-          elif [[ "$STACK_STATUS" == "CREATE_IN_PROGRESS" ]]; then
-            echo "⏳ Stack creation in progress, waiting for completion..."
-            aws cloudformation wait stack-create-complete \
-              --stack-name $STACK_NAME \
-              --region us-east-1 2>/dev/null || {
-              echo "⚠️  Wait timed out or failed, checking status..."
-              FINAL_STATUS=$(aws cloudformation describe-stacks \
-                --stack-name $STACK_NAME \
-                --query 'Stacks[0].StackStatus' \
-                --output text 2>/dev/null || echo "")
-              echo "Final status: $FINAL_STATUS"
-            }
-          elif [[ "$STACK_STATUS" == *"FAILED"* ]] || [[ "$STACK_STATUS" == *"ROLLBACK"* ]]; then
-            echo "⚠️  Stack is in $STACK_STATUS state, deleting..."
-            aws cloudformation delete-stack --stack-name $STACK_NAME 2>/dev/null || true
-            sleep 10
-          else
-            echo "⚠️  Stack status: $STACK_STATUS"
-          fi
+      - name: Build CDK TypeScript
+        working-directory: infra
+        run: npm run build
 
-      - name: Clean up existing S3 bucket if it exists
-        env:
-          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
-        run: |
-          BUCKET_NAME="snaphomz-india-$ENVIRONMENT-${{ secrets.AWS_ACCOUNT_ID }}"
-          echo "🧹 Checking for existing S3 bucket: $BUCKET_NAME"
-          
-          if aws s3 ls "s3://$BUCKET_NAME" 2>/dev/null; then
-            echo "🗑️  Deleting existing S3 bucket and contents..."
-            aws s3 rm "s3://$BUCKET_NAME" --recursive
-            aws s3api delete-bucket --bucket "$BUCKET_NAME" --region us-east-1
-            echo "✅ Bucket deleted successfully"
-            
-            # Wait for bucket deletion to complete
-            sleep 5
-          else
-            echo "✅ No existing bucket found, proceeding with deployment"
-          fi
-
-      - name: Deploy infrastructure with CDK
+      - name: Deploy static site stack
         working-directory: infra
         env:
-          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
           CUSTOM_DOMAIN: snaphomz.in
+          HOSTED_ZONE_ID: ${{ needs.hosted-zone.outputs.hosted_zone_id }}
           HOSTED_ZONE_NAME: snaphomz.in
           CREATE_CERTIFICATE: 'true'
-          CREATE_HOSTED_ZONE: 'true'
         run: |
-          # Build CDK app TypeScript
-          echo "📦 Building CDK app TypeScript..."
-          npm run build
-          echo "✅ Build complete"
-          
-          # Step 1: Check for existing hosted zone
-          echo "🔍 Checking for existing hosted zone for snaphomz.in..."
-          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-            --dns-name snaphomz.in \
-            --query 'HostedZones[0].Id' \
-            --output text 2>/dev/null | cut -d'/' -f3)
-          
-          echo "📋 Zone ID query result: '$HOSTED_ZONE_ID'"
-          
-          if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ] || [ "$HOSTED_ZONE_ID" == "" ]; then
-            echo "✅ Hosted zone not found. Creating..."
-            
-            # Deploy hosted zone stack with detailed error output
-            echo "📡 Deploying SnaphomzHostedZone stack..."
-            if npx cdk deploy SnaphomzHostedZone \
-              -c deploy-mode=hosted-zone \
-              --require-approval never 2>&1 | tee hosted-zone-deploy.log; then
-              echo "✅ Hosted zone deployment succeeded"
-            else
-              DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
-              echo "❌ Hosted zone deployment failed with exit code: $DEPLOY_EXIT_CODE"
-              echo "📋 Deployment log:"
-              cat hosted-zone-deploy.log
-              exit $DEPLOY_EXIT_CODE
-            fi
-            
-            # Query AWS Route53 again to get the created zone ID (with retries for eventual consistency)
-            echo "⏳ Waiting for hosted zone to be created..."
-            sleep 3
-            HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-              --dns-name snaphomz.in \
-              --query 'HostedZones[0].Id' \
-              --output text 2>/dev/null | cut -d'/' -f3)
-            
-            echo "📋 Zone ID after creation: '$HOSTED_ZONE_ID'"
-            
-            if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ]; then
-              echo "⚠️  Could not retrieve hosted zone ID after creation, retrying..."
-              sleep 5
-              HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-                --dns-name snaphomz.in \
-                --query 'HostedZones[0].Id' \
-                --output text 2>/dev/null | cut -d'/' -f3)
-              echo "📋 Zone ID after retry: '$HOSTED_ZONE_ID'"
-            fi
-            
-            if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ]; then
-              echo "❌ Failed to get hosted zone ID"
-              HOSTED_ZONE_ID=""
-            else
-              echo "✅ Created hosted zone: $HOSTED_ZONE_ID"
-            fi
-          else
-            echo "✅ Using existing hosted zone: $HOSTED_ZONE_ID"
-          fi
-          
-          # Step 2: Deploy static site stack with validated hosted zone ID
-          echo ""
-          echo "📡 Deploying static site stack..."
-          if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" == "None" ] || [ "$HOSTED_ZONE_ID" == "" ]; then
-            echo "⚠️  Warning: Hosted zone ID not found/empty, deploying without custom domain"
-            echo "📋 Deployment will create S3 and CloudFront but NO Route53 Alias record"
-            npx cdk deploy snaphomz-india-$ENVIRONMENT \
-              -c deploy-mode=static-site \
-              --require-approval never
-          else
-            echo "✅ Deploying static site stack with hosted zone: $HOSTED_ZONE_ID"
-            echo "📋 This will create Route53 Alias record: snaphomz.in → CloudFront"
-            npx cdk deploy snaphomz-india-$ENVIRONMENT \
-              -c deploy-mode=static-site \
-              -c hosted-zone-id=$HOSTED_ZONE_ID \
-              --require-approval never
-          fi
-          echo "✅ Static site deployment complete"
+          echo "🚀 Deploying snaphomz-india-${{ needs.setup.outputs.environment }}..."
+          echo "   Hosted Zone: $HOSTED_ZONE_ID"
+          npx cdk deploy snaphomz-india-${{ needs.setup.outputs.environment }} \
+            --require-approval never
+          echo "✅ CDK stack deployed"
 
-      - name: Get S3 bucket name and CloudFront distribution ID
+      # ── Get S3 + CloudFront identifiers from SSM ───────────────────────────
+      - name: Get deployment resources from SSM
         id: aws-resources
         env:
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
         run: |
-          BUCKET_NAME=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/bucket-name --query 'Parameter.Value' --output text)
-          DISTRIBUTION_ID=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/distribution-id --query 'Parameter.Value' --output text)
-          DISTRIBUTION_DOMAIN=$(aws ssm get-parameter --name /snaphomz/india/$ENVIRONMENT/distribution-domain --query 'Parameter.Value' --output text)
-          
-          echo "bucket-name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          BUCKET_NAME=$(aws ssm get-parameter \
+            --name /snaphomz/india/$ENVIRONMENT/bucket-name \
+            --query 'Parameter.Value' --output text)
+          DISTRIBUTION_ID=$(aws ssm get-parameter \
+            --name /snaphomz/india/$ENVIRONMENT/distribution-id \
+            --query 'Parameter.Value' --output text)
+          DISTRIBUTION_DOMAIN=$(aws ssm get-parameter \
+            --name /snaphomz/india/$ENVIRONMENT/distribution-domain \
+            --query 'Parameter.Value' --output text)
+          echo "bucket-name=$BUCKET_NAME"         >> $GITHUB_OUTPUT
           echo "distribution-id=$DISTRIBUTION_ID" >> $GITHUB_OUTPUT
           echo "distribution-domain=$DISTRIBUTION_DOMAIN" >> $GITHUB_OUTPUT
-          echo "S3 Bucket: $BUCKET_NAME"
-          echo "CloudFront Distribution: $DISTRIBUTION_ID"
-          echo "Distribution Domain: $DISTRIBUTION_DOMAIN"
+          echo "S3 Bucket:    $BUCKET_NAME"
+          echo "CF Distribution: $DISTRIBUTION_ID"
+          echo "CF Domain:    $DISTRIBUTION_DOMAIN"
 
+      # ── Upload built files to S3 ───────────────────────────────────────────
+      # Pattern: snaphomz-toolpage upload step
       - name: Upload to S3
         env:
           BUCKET_NAME: ${{ steps.aws-resources.outputs.bucket-name }}
         run: |
-          # Upload static assets with long cache
+          # Long-lived cache for hashed assets
           aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
             --cache-control "public, max-age=31536000" \
-            --exclude "*.html" \
-            --exclude "*.json" \
-            --exclude "*.xml"
-          
-          # Upload HTML with short cache
-          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --exclude "*.html" --exclude "*.json" --exclude "*.xml"
+
+          # No cache for HTML entry points
+          aws s3 sync dist/ s3://$BUCKET_NAME/ \
             --cache-control "public, max-age=0, must-revalidate" \
-            --include "*.html" \
-            --content-type "text/html"
-          
-          # Upload manifest and config files
-          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --include "*.html" --content-type "text/html"
+
+          # Short cache for manifests / config
+          aws s3 sync dist/ s3://$BUCKET_NAME/ \
             --cache-control "public, max-age=3600" \
-            --include "*.json" \
-            --include "*.xml"
+            --include "*.json" --include "*.xml"
 
       - name: Invalidate CloudFront cache
         env:
           DISTRIBUTION_ID: ${{ steps.aws-resources.outputs.distribution-id }}
         run: |
-          aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
-          echo "CloudFront cache invalidation initiated"
+          aws cloudfront create-invalidation \
+            --distribution-id $DISTRIBUTION_ID \
+            --paths "/*"
+          echo "✅ CloudFront cache invalidation initiated"
 
       - name: Deployment summary
-        id: deployment
         env:
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
-          DISTRIBUTION_ID: ${{ steps.aws-resources.outputs.distribution-id }}
           DISTRIBUTION_DOMAIN: ${{ steps.aws-resources.outputs.distribution-domain }}
         run: |
-          # Determine the URL
-          URL="https://$DISTRIBUTION_DOMAIN"
-          echo "url=$URL" >> $GITHUB_OUTPUT
-          
-          echo "✅ Deployment Complete!"
-          echo "Environment: $ENVIRONMENT"
-          echo "S3 Bucket: ${{ steps.aws-resources.outputs.bucket-name }}"
-          echo "CloudFront Distribution: $DISTRIBUTION_ID"
-          echo "Distribution Domain: $DISTRIBUTION_DOMAIN"
-          echo "URL: $URL"
-          echo "Deployment URL: $URL"
-
-  notify:
-    needs: [setup, build-and-deploy]
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: Send Slack notification
-        uses: slackapi/slack-github-action@v1
-        with:
-          payload: |
-            {
-              "text": "Snaphomz India Deployment ${{ job.status }}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Snaphomz India Deployment ${{ job.status }}*\n*Environment:* ${{ needs.setup.outputs.environment }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
-                  }
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
-        continue-on-error: true
+          echo "✅ Deployment complete!"
+          echo "   Environment:  $ENVIRONMENT"
+          echo "   Custom URL:   https://snaphomz.in"
+          echo "   CF Domain:    https://$DISTRIBUTION_DOMAIN"
+          echo "   S3 Bucket:    ${{ steps.aws-resources.outputs.bucket-name }}"
+          echo "   CF Dist ID:   ${{ steps.aws-resources.outputs.distribution-id }}"
