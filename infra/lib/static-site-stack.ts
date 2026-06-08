@@ -10,10 +10,10 @@ import { Construct } from 'constructs';
 
 interface StaticSiteStackProps extends cdk.StackProps {
   environment: string;
-  customDomain?: string;
+  customDomain?: string;   // e.g. snaphomz.in
+  wwwDomain?: string;      // e.g. www.snaphomz.in
   hostedZoneId?: string;
   hostedZoneName?: string;
-  certificateArn?: string;
 }
 
 export class StaticSiteStack extends cdk.Stack {
@@ -45,13 +45,27 @@ export class StaticSiteStack extends cdk.Stack {
     });
     siteBucket.grantRead(oai);
 
-    // Certificate - import existing ISSUED cert by ARN (no DNS validation wait)
+    // ACM Certificate - covers both apex and www (matches snaphomz.com pattern)
+    // DNS validation uses Route53 hosted zone - fast since zone already exists
     let certificate: acm.ICertificate | undefined;
     const domainNames: string[] = [];
 
-    if (props.customDomain && props.certificateArn) {
-      certificate = acm.Certificate.fromCertificateArn(this, 'Certificate', props.certificateArn);
+    if (props.customDomain && props.hostedZoneId && props.hostedZoneName) {
+      const hostedZoneForCert = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZoneForCert', {
+        hostedZoneId: props.hostedZoneId,
+        zoneName: props.hostedZoneName,
+      });
+
+      const sanDomains = props.wwwDomain ? [props.wwwDomain] : [];
+
+      certificate = new acm.Certificate(this, 'Certificate', {
+        domainName: props.customDomain,
+        subjectAlternativeNames: sanDomains,
+        validation: acm.CertificateValidation.fromDns(hostedZoneForCert),
+      });
+
       domainNames.push(props.customDomain);
+      if (props.wwwDomain) domainNames.push(props.wwwDomain);
     }
 
     // CloudFront distribution
@@ -75,8 +89,7 @@ export class StaticSiteStack extends cdk.Stack {
     this.distributionDomainName = distribution.domainName;
     this.distributionId = distribution.distributionId;
 
-    // Route53 A + AAAA alias records pointing to CloudFront
-    // Used when Route53 is authoritative (NS delegated from Namecheap)
+    // Route53 A + AAAA for apex and www - matches snaphomz.com pattern
     if (props.customDomain && props.hostedZoneId && props.hostedZoneName) {
       const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
         hostedZoneId: props.hostedZoneId,
@@ -87,17 +100,31 @@ export class StaticSiteStack extends cdk.Stack {
         new route53Targets.CloudFrontTarget(distribution),
       );
 
+      // Apex records: snaphomz.in
       new route53.ARecord(this, 'ARecord', {
         zone: hostedZone,
         recordName: props.customDomain,
         target: cfTarget,
       });
-
       new route53.AaaaRecord(this, 'AaaaRecord', {
         zone: hostedZone,
         recordName: props.customDomain,
         target: cfTarget,
       });
+
+      // www records: www.snaphomz.in
+      if (props.wwwDomain) {
+        new route53.ARecord(this, 'WwwARecord', {
+          zone: hostedZone,
+          recordName: props.wwwDomain,
+          target: cfTarget,
+        });
+        new route53.AaaaRecord(this, 'WwwAaaaRecord', {
+          zone: hostedZone,
+          recordName: props.wwwDomain,
+          target: cfTarget,
+        });
+      }
     }
 
     // SSM Parameter Store

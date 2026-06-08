@@ -29,8 +29,6 @@ on:
 env:
   AWS_REGION: us-east-1
   NODE_VERSION: '20'
-  # ACM cert for snaphomz.in - already ISSUED in us-east-1 (required for CloudFront)
-  CERTIFICATE_ARN: arn:aws:acm:us-east-1:075502422618:certificate/cb92c6e2-9b6e-4426-b9ca-045b67bd4499
 
 jobs:
   # ── Job 1: Determine environment ───────────────────────────────────────────
@@ -179,15 +177,30 @@ jobs:
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
           CUSTOM_DOMAIN: snaphomz.in
+          WWW_DOMAIN: www.snaphomz.in
           HOSTED_ZONE_ID: ${{ needs.hosted-zone.outputs.hosted_zone_id }}
           HOSTED_ZONE_NAME: snaphomz.in
-          CERTIFICATE_ARN: ${{ env.CERTIFICATE_ARN }}
         run: |
           echo "Deploying snaphomz-india-$ENVIRONMENT..."
-          echo "Hosted Zone: $HOSTED_ZONE_ID"
-          echo "Cert ARN:    $CERTIFICATE_ARN"
+          echo "Hosted Zone:  $HOSTED_ZONE_ID"
+          echo "Custom Domain: $CUSTOM_DOMAIN"
+          echo "WWW Domain:    $WWW_DOMAIN"
           npx cdk deploy snaphomz-india-$ENVIRONMENT --require-approval never
           echo "CDK deploy complete"
+
+      - name: Namecheap www DNS instruction
+        run: |
+          CF_DOMAIN=$(aws ssm get-parameter \
+            --name /snaphomz/india/${{ needs.setup.outputs.environment }}/distribution-domain \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          echo "============================================================"
+          echo "ACTION REQUIRED in Namecheap Advanced DNS for snaphomz.in:"
+          echo "  Add CNAME record:"
+          echo "    Host:  www"
+          echo "    Value: ${CF_DOMAIN:-d2arydz9wf692w.cloudfront.net}"
+          echo "    TTL:   Automatic"
+          echo "  (Only needed once - skip if already added)"
+          echo "============================================================"
 
       - name: Get deployment resources from SSM
         id: resources
