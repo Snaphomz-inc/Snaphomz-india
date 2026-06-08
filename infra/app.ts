@@ -14,12 +14,14 @@ if (!awsAccount) {
   throw new Error('AWS_ACCOUNT_ID environment variable is required');
 }
 
-const domainName   = process.env.DOMAIN_NAME    || 'snaphomz.in';
-const customDomain = process.env.CUSTOM_DOMAIN  || 'snaphomz.in';
-const wwwDomain    = process.env.WWW_DOMAIN     || 'www.snaphomz.in';
-const hostedZoneId = process.env.HOSTED_ZONE_ID || undefined;
+const domainName     = process.env.DOMAIN_NAME     || 'snaphomz.in';
+const customDomain   = process.env.CUSTOM_DOMAIN   || 'snaphomz.in';
+const wwwDomain      = process.env.WWW_DOMAIN      || 'www.snaphomz.in';
+const hostedZoneId   = process.env.HOSTED_ZONE_ID  || undefined;
 const hostedZoneName = process.env.HOSTED_ZONE_NAME || 'snaphomz.in';
-// certificateArn removed - CDK will create new cert covering apex + www via DNS validation
+// Cert must be pre-created + ISSUED before CDK deploy (see prepare-certificate job in CI)
+// Must cover both snaphomz.in and www.snaphomz.in as SANs
+const certificateArn = process.env.CERTIFICATE_ARN || undefined;
 
 const env = { account: awsAccount, region: awsRegion };
 
@@ -30,12 +32,13 @@ new HostedZoneStack(app, 'SnaphomzHostedZone', {
   description: `Route53 Hosted Zone for ${domainName}`,
 });
 
-// Stack 2: S3 + CloudFront + new cert (apex + www) + Route53 A/AAAA records
+// Stack 2: S3 + CloudFront + Route53 A/AAAA records (cert imported by ARN)
 new StaticSiteStack(app, `snaphomz-india-${environment}`, {
   env,
   environment,
   customDomain,
   wwwDomain,
+  certificateArn,
   hostedZoneId,
   hostedZoneName,
   description: `Snaphomz India Static Site - ${environment}`,

@@ -10,8 +10,9 @@ import { Construct } from 'constructs';
 
 interface StaticSiteStackProps extends cdk.StackProps {
   environment: string;
-  customDomain?: string;   // e.g. snaphomz.in
-  wwwDomain?: string;      // e.g. www.snaphomz.in
+  customDomain?: string;    // e.g. snaphomz.in
+  wwwDomain?: string;       // e.g. www.snaphomz.in  (CF aliases + Route53 only)
+  certificateArn?: string;  // pre-existing ISSUED cert covering both apex + www
   hostedZoneId?: string;
   hostedZoneName?: string;
 }
@@ -45,25 +46,14 @@ export class StaticSiteStack extends cdk.Stack {
     });
     siteBucket.grantRead(oai);
 
-    // ACM Certificate - covers both apex and www (matches snaphomz.com pattern)
-    // DNS validation uses Route53 hosted zone - fast since zone already exists
+    // ACM Certificate - import pre-existing ISSUED cert by ARN
+    // Cert must already cover both apex (snaphomz.in) and www.snaphomz.in as SANs
+    // Use the prepare-certificate job in CI to create/validate the cert first
     let certificate: acm.ICertificate | undefined;
     const domainNames: string[] = [];
 
-    if (props.customDomain && props.hostedZoneId && props.hostedZoneName) {
-      const hostedZoneForCert = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZoneForCert', {
-        hostedZoneId: props.hostedZoneId,
-        zoneName: props.hostedZoneName,
-      });
-
-      const sanDomains = props.wwwDomain ? [props.wwwDomain] : [];
-
-      certificate = new acm.Certificate(this, 'Certificate', {
-        domainName: props.customDomain,
-        subjectAlternativeNames: sanDomains,
-        validation: acm.CertificateValidation.fromDns(hostedZoneForCert),
-      });
-
+    if (props.customDomain && props.certificateArn) {
+      certificate = acm.Certificate.fromCertificateArn(this, 'Certificate', props.certificateArn);
       domainNames.push(props.customDomain);
       if (props.wwwDomain) domainNames.push(props.wwwDomain);
     }

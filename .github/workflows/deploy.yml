@@ -1,12 +1,16 @@
 name: Deploy Snaphomz India to AWS
 
-# 3-job architecture:
-#   Job 1 (setup):          determine environment from branch
-#   Job 2 (hosted-zone):    create Route53 hosted zone if not exists, output zone ID
-#   Job 3 (deploy):         build Vite, CDK deploy (S3+CF+cert+A/AAAA), S3 upload, CF invalidate
+# 4-job architecture:
+#   Job 1 (setup):               determine environment from branch
+#   Job 2 (hosted-zone):         create Route53 hosted zone if not exists, output zone ID
+#   Job 3 (prepare-certificate): find/create ACM cert (snaphomz.in + www.snaphomz.in)
+#                                  - First run: prints Namecheap CNAME instructions + fails
+#                                  - Re-run after cert ISSUED: outputs cert ARN
+#   Job 4 (deploy):              build Vite, CDK deploy (S3+CF+cert by ARN), S3 upload, CF invalidate
 #
-# ACM cert already ISSUED - imported by ARN so no DNS validation wait in job 3.
-# Namecheap ALIAS -> CloudFront handles live traffic until NS is delegated to Route53.
+# Why no cert creation in CDK: Namecheap is authoritative (not Route53), so CDK's
+# CertificateValidation.fromDns() would add CNAMEs to Route53 but ACM validates against
+# Namecheap — validation never completes and the OIDC token (1h) expires.
 
 on:
   push:
@@ -127,9 +131,119 @@ jobs:
             echo "$NS" | tr ',' '\n'
           fi
 
-  # ── Job 3: Build + CDK deploy + S3 upload ─────────────────────────────────
-  deploy:
+  # ── Job 3: Ensure ACM cert is ISSUED (snaphomz.in + www.snaphomz.in) ───────
+  # Namecheap is authoritative — we cannot use CDK/Route53 DNS validation.
+  # Strategy: request cert via CLI, store ARN in SSM, output Namecheap CNAME
+  # instructions, and FAIL until user adds the CNAMEs and cert reaches ISSUED.
+  # On re-run (cert already ISSUED), outputs cert_arn and continues to deploy.
+  prepare-certificate:
     needs: [setup, hosted-zone]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      cert_arn: ${{ steps.check-cert.outputs.cert_arn }}
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Find or create certificate
+        id: check-cert
+        run: |
+          set -e
+          SSM_PARAM="/snaphomz/india/certificate-with-www-arn"
+          APEX="snaphomz.in"
+          WWW="www.snaphomz.in"
+
+          # ── Try SSM-stored ARN first ──────────────────────────────────────
+          CERT_ARN=$(aws ssm get-parameter \
+            --name "$SSM_PARAM" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+
+          if [[ -n "$CERT_ARN" ]]; then
+            STATUS=$(aws acm describe-certificate \
+              --certificate-arn "$CERT_ARN" \
+              --query 'Certificate.Status' --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "Stored cert $CERT_ARN status: $STATUS"
+
+            if [[ "$STATUS" == "ISSUED" ]]; then
+              echo "cert_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+              echo "Certificate is ISSUED. Continuing to deploy."
+              exit 0
+            elif [[ "$STATUS" == "PENDING_VALIDATION" ]]; then
+              echo ""
+              echo "================================================================"
+              echo " CERT PENDING VALIDATION — ACTION REQUIRED IN NAMECHEAP"
+              echo "================================================================"
+              echo " Add these CNAME records in Namecheap > Advanced DNS > snaphomz.in:"
+              echo ""
+              aws acm describe-certificate --certificate-arn "$CERT_ARN" \
+                --query 'Certificate.DomainValidationOptions[].[DomainName,ResourceRecord.Name,ResourceRecord.Value]' \
+                --output text | while IFS=$'\t' read -r domain name value; do
+                  # Strip trailing dots and the apex domain from the host
+                  HOST=$(echo "$name" | sed "s/\\.${APEX}\\.$//; s/\\.$//")
+                  echo "  Domain : $domain"
+                  echo "  Type   : CNAME"
+                  echo "  Host   : $HOST"
+                  echo "  Value  : $value"
+                  echo ""
+                done
+              echo "  Then wait ~5 min for ACM to validate, then re-run this workflow."
+              echo "================================================================"
+              exit 1
+            else
+              echo "Stored cert status '$STATUS' — will request a new cert."
+            fi
+          fi
+
+          # ── No valid stored cert — request a new one ──────────────────────
+          echo "Requesting new ACM certificate: $APEX + $WWW ..."
+          CERT_ARN=$(aws acm request-certificate \
+            --domain-name "$APEX" \
+            --subject-alternative-names "$WWW" \
+            --validation-method DNS \
+            --idempotency-token snaphomzindiawww1 \
+            --query 'CertificateArn' --output text)
+
+          echo "New cert ARN: $CERT_ARN"
+          aws ssm put-parameter \
+            --name "$SSM_PARAM" \
+            --value "$CERT_ARN" \
+            --type String \
+            --overwrite
+
+          # Wait for validation records to populate
+          sleep 20
+
+          echo ""
+          echo "================================================================"
+          echo " NEW CERT REQUESTED — ACTION REQUIRED IN NAMECHEAP"
+          echo "================================================================"
+          echo " Add these CNAME records in Namecheap > Advanced DNS > snaphomz.in:"
+          echo ""
+          aws acm describe-certificate --certificate-arn "$CERT_ARN" \
+            --query 'Certificate.DomainValidationOptions[].[DomainName,ResourceRecord.Name,ResourceRecord.Value]' \
+            --output text | while IFS=$'\t' read -r domain name value; do
+              HOST=$(echo "$name" | sed "s/\\.${APEX}\\.$//; s/\\.$//")
+              echo "  Domain : $domain"
+              echo "  Type   : CNAME"
+              echo "  Host   : $HOST"
+              echo "  Value  : $value"
+              echo ""
+            done
+          echo "  Then wait ~5 min for ACM to validate, then re-run this workflow."
+          echo "================================================================"
+          exit 1
+
+  # ── Job 4: Build + CDK deploy + S3 upload ─────────────────────────────────
+  deploy:
+    needs: [setup, hosted-zone, prepare-certificate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -180,27 +294,15 @@ jobs:
           WWW_DOMAIN: www.snaphomz.in
           HOSTED_ZONE_ID: ${{ needs.hosted-zone.outputs.hosted_zone_id }}
           HOSTED_ZONE_NAME: snaphomz.in
+          CERTIFICATE_ARN: ${{ needs.prepare-certificate.outputs.cert_arn }}
         run: |
           echo "Deploying snaphomz-india-$ENVIRONMENT..."
-          echo "Hosted Zone:  $HOSTED_ZONE_ID"
+          echo "Hosted Zone:   $HOSTED_ZONE_ID"
           echo "Custom Domain: $CUSTOM_DOMAIN"
           echo "WWW Domain:    $WWW_DOMAIN"
+          echo "Cert ARN:      $CERTIFICATE_ARN"
           npx cdk deploy snaphomz-india-$ENVIRONMENT --require-approval never
           echo "CDK deploy complete"
-
-      - name: Namecheap www DNS instruction
-        run: |
-          CF_DOMAIN=$(aws ssm get-parameter \
-            --name /snaphomz/india/${{ needs.setup.outputs.environment }}/distribution-domain \
-            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-          echo "============================================================"
-          echo "ACTION REQUIRED in Namecheap Advanced DNS for snaphomz.in:"
-          echo "  Add CNAME record:"
-          echo "    Host:  www"
-          echo "    Value: ${CF_DOMAIN:-d2arydz9wf692w.cloudfront.net}"
-          echo "    TTL:   Automatic"
-          echo "  (Only needed once - skip if already added)"
-          echo "============================================================"
 
       - name: Get deployment resources from SSM
         id: resources
